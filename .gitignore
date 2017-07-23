@@ -3,3 +3,7 @@ dataset/MultiNLI/*
 dataset/SNLI/*
 *.ipynb_checkpoints/
 *__pycache__/
+dataset*
+savedir*
+*.pickle
+multinli_all*
