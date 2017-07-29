@@ -7,3 +7,4 @@ dataset*
 savedir*
 *.pickle
 multinli_all*
+*.csv
