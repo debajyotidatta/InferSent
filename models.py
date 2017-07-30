@@ -253,6 +253,7 @@ class BGRUlastEncoder(nn.Module):
         self.enc_lstm_dim = config['enc_lstm_dim']
         self.pool_type = config['pool_type']
         self.dpout_model = config['dpout_model']
+        self.use_cuda = config['use_cuda']
 
         self.enc_lstm = nn.GRU(self.word_emb_dim, self.enc_lstm_dim, 1, bidirectional=True, dropout=self.dpout_model)
         self.init_lstm = Variable(torch.FloatTensor(2, self.bsize, self.enc_lstm_dim).zero_()).cuda()
@@ -268,6 +269,7 @@ class BGRUlastEncoder(nn.Module):
 
         # Sort by length (keep idx)
         sent_len, idx_sort = np.sort(sent_len)[::-1], np.argsort(-sent_len)
+        idx_sort = torch.from_numpy(idx_sort).cuda() if self.use_cuda else torch.from_numpy(idx_sort)
         sent = sent.index_select(1, Variable(torch.cuda.LongTensor(idx_sort)))
 
         # Handling padding in Recurrent Networks
@@ -277,6 +279,7 @@ class BGRUlastEncoder(nn.Module):
 
         # Un-sort by length
         idx_unsort = np.argsort(idx_sort)
+        idx_unsort = torch.from_numpy(idx_unsort).cuda() if self.use_cuda else torch.from_numpy(idx_unsort)
         emb = emb.index_select(0, Variable(torch.cuda.LongTensor(idx_unsort)))
 
         return emb
