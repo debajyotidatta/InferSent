@@ -1,118 +1,499 @@
-# InferSent
 
-*InferSent* is a *sentence embeddings* method that provides semantic sentence representations. It is trained on natural language inference data and generalizes well to many different tasks.
+# Introduction to Semantic Entailment
 
-We provide our pre-trained sentence encoder for reproducing the results from [our paper](https://arxiv.org/abs/1705.02364). See also [SentEval](https://github.com/facebookresearch/SentEval) for automatic evaluation of the quality of sentence embeddings.
+<b> TLDR; </b> The goal of this blog post is to create a framework for experiments on the multinli dataset released by the fantastic group at NYU. The code is largely modified from the recent paper from facebook, [InferSent](https://github.com/facebookresearch/InferSent) and with some modifications added to allow for customization of tokenizations and loading of the datasets and improvements in the model. Also some new additions include addition of scripts that generate the csvs for the predictions of the multinli challenge, both for the matched test set and the mismatched test set.
 
-## Dependencies
+The task of semantic entailment is one of the fundemental natural language challenges where the goal is to have sentence pairs manually labeled for classification into three categories: entailment, contradition and neutral. In its previous reincarnation it was also known as recognizing textual entailment. This task is interesting particularly because of two specific reasons. 
 
-This code is written in python. The dependencies are:
+<ul>
+<li> One of the largest labelled natural languages corpus that is publicly available. This is interesting since, this not only helps address, this specific task and trying to solve it, but this corpus is also interesting since it can be used to train generic sentence encoders that can then be used for a variety of tasks.
 
-* Python 2.7 (with recent versions of [NumPy](http://www.numpy.org/)/[SciPy](http://www.scipy.org/))
-* [Pytorch](http://pytorch.org/) >= 0.12
-* NLTK >= 3
+<li> Another reason is the task of semantic entailment, because of it being a large dataset is an active area of research and there is a great scope for research and pushing the understanding of natural language.
+</ul>
 
-## Download datasets
-To get GloVe, SNLI and MultiNLI [2GB, 90MB, 216MB], run (in dataset/):
-```bash
-./get_data.bash
-```
-This will download GloVe and preprocess SNLI/MultiNLI datasets.
+### Goal of this post
+
+This post I think can benefit in a couple of ways. 
+<ul>
+<li> I have explained and deconstructed the pytorch code from Conneau et al., for the Infersent Paper and modified it at tiny bits to make understanding easy and enable rapid iterations for the task of semantic entailment.
+<li> Added various options to customize things like the tokenizer to use, or text preprocessing to use and so on. In many cases that can lead to a significant difference in performance.
+</ul>
+
+### Import of general libraries
 
 
-## Use our sentence encoder
-We provide a simple interface to encode english sentences. See [**encoder/play.ipynb**](https://github.com/facebookresearch/InferSent/blob/master/encoder/play.ipynb)
-for a practical example. Get started with the following steps:
-
-*0.0) Download our model trained on AllNLI (SNLI and MultiNLI) [147MB]:*
-```bash
-curl -Lo encoder/infersent.allnli.pickle https://s3.amazonaws.com/senteval/infersent/infersent.allnli.pickle
-```
-
-*0.1) Make sure you have the NLTK tokenizer by running the following once:*
 ```python
-import nltk
-nltk.download('punkt')
-```
+import json
+import pandas as pd
 
-*1) Load our pre-trained model (in encoder/):*
-```python
+import time
+import argparse
+import sys, os
+
+import numpy as np
+import random
+
 import torch
-# if you are on GPU (encoding ~1000 sentences/s, default)
-infersent = torch.load('infersent.allnli.pickle')
-# if you are on CPU (~40 sentences/s)
-infersent = torch.load('infersent.allnli.pickle', map_location=lambda storage, loc: storage)
-infersent.use_cuda = False
-```
-Note: To load the model, you need "encoder/models.py" in your working directory.
+from torch.autograd import Variable
+import torch.nn as nn
 
-*2) Set GloVe path for the model:*
+from data import get_batch
+from mutils import get_optimizer, dotdict
+from models import NLINet
+from nltk.tokenize import TreebankWordTokenizer
+GLOVE_PATH = "/home/ubuntu/Dropbox/xai/AdditionalStuff/RepEval2017/multiNLI/data/glove.840B.300d.txt"
+```
+
+
 ```python
-infersent.set_glove_path(glove_path)
+def loadDataset(filename, size=-1):
+    label_category = {
+        'neutral': 0,
+        'entailment': 1,
+        'contradiction': 2
+    }
+    dataset = []
+    sentence1 = []
+    sentence2 = []
+    labels = []
+    with open(filename, 'r') as f:
+        i = 0
+        not_found = 0
+        for line in f:
+            row = json.loads(line, 'utf-8')
+            if size == -1 or i < size:
+                dataset.append(row)
+                label = row['gold_label'].strip()
+                if label in label_category:
+                    sentence1.append( row['sentence1'].strip() )
+                    sentence2.append( row['sentence2'].strip() )
+
+                    labels.append( label_category[label] )
+                    i += 1
+                else:
+                    not_found += 1
+            else:
+                break;
+        if not_found > 0:
+            print('Label not recognized %d' % not_found)
+                
+    return (dataset, sentence1, sentence2, labels)
 ```
-where *glove_path* is the path to *'glove.840B.300d.txt'*, containing glove vectors with which our model was trained. Note that using [GloVe](https://nlp.stanford.edu/projects/glove/) vectors allows to have a coverage of more than *2 million* english words.
 
 
-*3) Build the vocabulary of word vectors (i.e keep only those needed):*
 ```python
-infersent.build_vocab(sentences, tokenize=True)
+(train_dataset, train_sentence1, train_sentence2, train_labels) = loadDataset('./multinli_all/multinli_0.9_train.jsonl')
+(dev_matched_dataset, dev_matched_sentence1, dev_matched_sentence2, dev_matched_labels) = loadDataset('./multinli_all/multinli_0.9_dev_matched.jsonl')
+(dev_mismatched_dataset, dev_mismatched_sentence1, dev_mismatched_sentence2, dev_mismatched_labels) = loadDataset('./multinli_all/multinli_0.9_dev_mismatched.jsonl')
+(test_matched_dataset, test_matched_sentence1, test_matched_sentence2, test_matched_labels) = loadDataset('./multinli_all/multinli_0.9_test_matched_unlabeled.jsonl')
+(test_mismatched_dataset, test_mismatched_sentence1, test_mismatched_sentence2, test_mismatched_labels) = loadDataset('./multinli_all/multinli_0.9_test_mismatched_unlabeled.jsonl')
 ```
-where *sentences* is your list of **n** sentences. You can update your vocabulary using *infersent.update_vocab(sentences)*, or directly load the **K** most common english words with *infersent.build_vocab_k_words(K=100000)*.
-If **tokenize** is True (by default), sentences will be tokenized using NTLK.
 
-*4) Encode your sentences (list of *n* sentences):*
+    Label not recognized 185
+    Label not recognized 168
+    Label not recognized 9796
+    Label not recognized 9847
+
+
+
 ```python
-infersent.encode(sentences, tokenize=True)
+train_set = pd.DataFrame(train_dataset)
+dev_matched_set = pd.DataFrame(dev_matched_dataset)
+dev_mismatched_set = pd.DataFrame(dev_mismatched_dataset)
+test_matched_set = pd.DataFrame(test_matched_dataset)
+test_mismatched_set = pd.DataFrame(test_mismatched_dataset)
 ```
-This will output an numpy array with *n* vectors of dimension **4096** (dimension of the sentence embeddings). Speed is around *1000 sentences per second* with batch size 128 on a single GPU.
 
-*5) Visualize the importance that our model attributes to each word:*
 
-Our representations were trained to focus on semantic information such that a classifier can easily tell the difference between contradictory, neutral or entailed sentences. We provide a function to visualize the importance of each word in the encoding of a sentence:
 ```python
-infersent.visualize('A man plays an instrument.', tokenize=True)
-```
-![Model](https://s3.amazonaws.com/senteval/infersent/visualization.png)
-
-
-## Train model on Natural Language Inference (SNLI)
-To reproduce our results and train our models on [SNLI](https://nlp.stanford.edu/projects/snli/), set **GLOVE_PATH** in *train_nli.py*, then run:
-```bash
-python train_nli.py
-```
-You should obtain a dev accuracy of 85 and a test accuracy of **[84.5](https://nlp.stanford.edu/projects/snli/)** with the default setting.
-
-## Reproduce our results on transfer tasks
-To reproduce our results on transfer tasks, clone [SentEval](https://github.com/facebookresearch/SentEval) and set **PATH_SENTEVAL**, **PATH_TRANSFER_TASKS** in *evaluate_model.py*, then run:
-```bash
-python evaluate_model.py
+dev_matched_set = dev_matched_set[dev_matched_set['gold_label']!='-']
+dev_mismatched_set = dev_mismatched_set[dev_mismatched_set['gold_label']!='-']
 ```
 
-Using our best model *infersent.allnli.pickle*, you should obtain the following test results:
+#### An opportunity to add custom tokenization! 
 
-Model | MR | CR | SUBJ | MPQA | STS14 | [STS Benchmark](http://ixa2.si.ehu.es/stswiki/index.php/STSbenchmark#Results) | SICK Relatedness | SICK Entailment | SST | TREC | MRPC
-:---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---:
-**`InferSent`** | **81.1** | **86.3** | 92.4 | **90.2** | **.68/.65** | **75.8/75.5** | **0.884** | **86.1** | **84.6** | 88.2 | 76.2/83.1
-`SkipThought` | 79.4 | 83.1 | **93.7** | 89.3 | .44/.45 | 72.1/70.2| 0.858 | 79.5 | 82.9 | 88.4 | - 
 
-Note that while InferSent provides good features for many different tasks, our approach also obtains strong results on STS tasks which evaluate the quality of the cosine metrics in the embedding space.
+```python
+train_sent1 = train_set['sentence1'].apply(TreebankWordTokenizer().tokenize)
+train_sent2 = train_set['sentence2'].apply(TreebankWordTokenizer().tokenize)
+dev_m_sent1 = dev_matched_set['sentence1'].apply(TreebankWordTokenizer().tokenize)
+dev_m_sent2 = dev_matched_set['sentence2'].apply(TreebankWordTokenizer().tokenize)
+dev_mis_sent1 = dev_mismatched_set['sentence1'].apply(TreebankWordTokenizer().tokenize)
+dev_mis_sent2 = dev_mismatched_set['sentence2'].apply(TreebankWordTokenizer().tokenize)
+test_m_sent1 = test_matched_set['sentence1'].apply(TreebankWordTokenizer().tokenize)
+test_m_sent2 = test_matched_set['sentence2'].apply(TreebankWordTokenizer().tokenize)
+test_mis_sent1 = test_mismatched_set['sentence1'].apply(TreebankWordTokenizer().tokenize)
+test_mis_sent2 = test_mismatched_set['sentence2'].apply(TreebankWordTokenizer().tokenize)
+```
 
-## Reference
 
-Please cite [1](https://arxiv.org/abs/1705.02364) if you found this code useful.
+```python
+def get_word_dict(sentences):
+    # create vocab of words
+    word_dict = {}
+    for sent in sentences:
+        for word in sent:
+            if word not in word_dict:
+                word_dict[word] = ''
+    word_dict['<s>'] = ''
+    word_dict['</s>'] = ''
+    word_dict['<p>'] = ''
+    return word_dict
+```
 
-### Supervised Learning of Universal Sentence Representations from Natural Language Inference Data
 
-[1] A. Conneau, D. Kiela, H. Schwenk, L. Barrault, A. Bordes, [*Supervised Learning of Universal Sentence Representations from Natural Language Inference Data*](https://arxiv.org/abs/1705.02364)
+```python
+def get_glove(word_dict, glove_path):
+    # create word_vec with glove vectors
+    word_vec = {}
+    with open(glove_path) as f:
+        for line in f:
+            word, vec = line.split(' ', 1)
+            if word in word_dict:
+                word_vec[word] = np.array(list(map(float, vec.split())))
+    print('Found {0}(/{1}) words with glove vectors'.format(len(word_vec), len(word_dict)))
+    return word_vec
+```
+
+
+```python
+def build_vocab(sentences, glove_path):
+    word_dict = get_word_dict(sentences)
+    word_vec = get_glove(word_dict, glove_path)
+    print('Vocab size : {0}'.format(len(word_vec)))
+    return word_vec
+```
+
+
+```python
+train1 = list(train_sent1)+list(train_sent2)
+dev1 = list(dev_m_sent1)+list(dev_m_sent2)+list(dev_mis_sent1)+list(dev_mis_sent2)
+test1 = list(test_m_sent1)+list(test_m_sent2)+list(test_mis_sent1)+list(test_mis_sent2)
+```
+
+
+```python
+word_vec = build_vocab(train1+dev1+test1, GLOVE_PATH)
+```
+
+
+```python
+train_set = {}
+dev_matched_set = {}
+dev_mismatched_set = {}
+test_matched_set = {}
+test_mismatched_set = {}
+```
+
+A really verbose way. (This needs to change)
+
+
+```python
+train_set['sentence1']  =list(train_sent1   )            
+train_set['sentence2']  =list(  train_sent2  )
+dev_matched_set['sentence1']  =list(  dev_m_sent1  )
+dev_matched_set['sentence2']  =list(  dev_m_sent2  )
+dev_mismatched_set['sentence1'] =list(  dev_mis_sent1) 
+dev_mismatched_set['sentence2'] =list(  dev_mis_sent2 )
+test_matched_set['sentence1'] =list(  test_m_sent1 )
+test_matched_set['sentence2'] =list(  test_m_sent2 )
+test_mismatched_set['sentence1'] =list(  test_mis_sent1) 
+test_mismatched_set['sentence2']=list(  test_mis_sent2)
+```
+
+
+```python
+word_vec = build_vocab(train_set['sentence1'] +train_set['sentence2'] +dev_matched_set['sentence1'] + dev_matched_set['sentence2'] +dev_mismatched_set['sentence1'] +dev_mismatched_set['sentence2'] + test_matched_set['sentence1'] + test_matched_set['sentence2'] +test_mismatched_set['sentence1'] +test_mismatched_set['sentence2'], GLOVE_PATH )
+```
+
+
+```python
+for split in ['sentence1', 'sentence2']:
+    for data_type in ['train_set', 'dev_matched_set', 'dev_mismatched_set', 'test_matched_set','test_mismatched_set']:
+        eval(data_type)[split] = np.array([['<s>'] + [word for word in sent if word in word_vec] +\
+                                          ['</s>'] for sent in eval(data_type)[split]])        
+
 
 ```
-@article{conneau2017supervised,
-  title={Supervised Learning of Universal Sentence Representations from Natural Language Inference Data},
-  author={Conneau, Alexis and Kiela, Douwe and Schwenk, Holger and Barrault, Loic and Bordes, Antoine},
-  journal={arXiv preprint arXiv:1705.02364},
-  year={2017}
+
+
+```python
+train_set['label'] = np.array(train_labels)
+dev_matched_set['label'] = np.array(dev_matched_labels)
+dev_mismatched_set['label'] = np.array(dev_mismatched_labels)
+```
+
+
+```python
+
+GLOVE_PATH = "dataset/GloVe/glove.840B.300d.txt"
+
+
+parser = argparse.ArgumentParser(description='NLI training')
+# paths
+parser.add_argument("--nlipath", type=str, default='dataset/MultiNLI/', help="NLI data path (SNLI or MultiNLI)")
+parser.add_argument("--outputdir", type=str, default='savedir3/', help="Output directory")
+parser.add_argument("--outputmodelname", type=str, default='model.pickle')
+
+
+# training
+parser.add_argument("--n_epochs", type=int, default=20)
+parser.add_argument("--batch_size", type=int, default=64)
+parser.add_argument("--dpout_model", type=float, default=0., help="encoder dropout")
+parser.add_argument("--dpout_fc", type=float, default=0., help="classifier dropout")
+parser.add_argument("--nonlinear_fc", type=float, default=0, help="use nonlinearity in fc")
+parser.add_argument("--optimizer", type=str, default="sgd,lr=0.1", help="adam or sgd,lr=0.1")
+parser.add_argument("--lrshrink", type=float, default=5, help="shrink factor for sgd")
+parser.add_argument("--decay", type=float, default=0.99, help="lr decay")
+parser.add_argument("--minlr", type=float, default=1e-5, help="minimum lr")
+parser.add_argument("--max_norm", type=float, default=5., help="max norm (grad clipping)")
+
+#model
+# BGRUlastEncoder
+# parser.add_argument("--encoder_type", type=str, default='BLSTMEncoder', help="see list of encoders")
+parser.add_argument("--encoder_type", type=str, default='BGRUlastEncoder', help="see list of encoders")
+parser.add_argument("--enc_lstm_dim", type=int, default=2048, help="encoder nhid dimension")
+parser.add_argument("--n_enc_layers", type=int, default=1, help="encoder num layers")
+parser.add_argument("--fc_dim", type=int, default=512, help="nhid of fc layers")
+parser.add_argument("--n_classes", type=int, default=3, help="entailment/neutral/contradiction")
+parser.add_argument("--pool_type", type=str, default='max', help="max or mean")
+
+# gpu
+parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID")
+parser.add_argument("--seed", type=int, default=1234, help="seed")
+
+
+params, _ = parser.parse_known_args(" ".split())
+```
+
+
+```python
+np.random.seed(params.seed)
+torch.manual_seed(params.seed)
+torch.cuda.manual_seed(params.seed)
+```
+
+
+```python
+params.word_emb_dim = 300
+"""
+MODEL
+"""
+# model config
+config_nli_model = {
+    'n_words'        :  len(word_vec)          ,
+    'word_emb_dim'   :  params.word_emb_dim   ,
+    'enc_lstm_dim'   :  params.enc_lstm_dim   ,
+    'n_enc_layers'   :  params.n_enc_layers   ,
+    'dpout_model'    :  params.dpout_model    ,
+    'dpout_fc'       :  params.dpout_fc       ,
+    'fc_dim'         :  params.fc_dim         ,
+    'bsize'          :  params.batch_size     ,
+    'n_classes'      :  params.n_classes      ,
+    'pool_type'      :  params.pool_type      ,
+    'nonlinear_fc'   :  params.nonlinear_fc   ,
+    'encoder_type'   :  params.encoder_type   ,
+    'use_cuda'       :  True                  ,
+
 }
+
+# model
+encoder_types = ['BLSTMEncoder', 'BLSTMprojEncoder', 'BGRUlastEncoder', 'InnerAttentionMILAEncoder',\
+                 'InnerAttentionYANGEncoder', 'InnerAttentionNAACLEncoder', 'ConvNetEncoder', 'LSTMEncoder']
+assert params.encoder_type in encoder_types, "encoder_type must be in " + str(encoder_types)
+nli_net = NLINet(config_nli_model)
+print(nli_net)
 ```
 
-Contact: [aconneau@fb.com](mailto:aconneau@fb.com)
+
+```python
+# loss
+weight = torch.FloatTensor(params.n_classes).fill_(1)
+loss_fn = nn.CrossEntropyLoss(weight=weight)
+loss_fn.size_average = False
+
+# optimizer
+optim_fn, optim_params = get_optimizer(params.optimizer)
+optimizer = optim_fn(nli_net.parameters(), **optim_params)
+
+# cuda by default
+nli_net.cuda()
+loss_fn.cuda()
+#src_embeddings.cuda()
+
+
+    
+"""
+TRAIN
+"""
+#src_embeddings.volatile = True
+val_acc_best = -1e10
+adam_stop = False
+stop_training = False
+lr = optim_params['lr'] if 'sgd' in params.optimizer else None
+#index_pad =word2id['<p>']
+```
+
+### Effective training in deep nueral nets is the key idea behind an algorithm or apporach working. 
+
+In the infersent paper, the training procedure is as follows:
+
+They use SGD with a learning rate of 0.1 and at each epoch they divide the learning rate by 5, by the dev set accuracy decreases. The weight decay is 0.99. With a minibatch size of 64, training is stopped when the learning rate goes under the threshold of 10<sup>-5</sup>.
+
+
+```python
+def trainepoch(epoch):
+    print('\nTRAINING : Epoch ' + str(epoch))
+    nli_net.train()
+    all_costs   = []
+    logs        = []
+    words_count = 0
+    
+    last_time = time.time()
+    correct = 0.
+    # shuffle the data
+    permutation = np.random.permutation(len(train_set['sentence1']))
+
+    s1 = train_set['sentence1'][permutation]
+    s2 = train_set['sentence2'][permutation]
+    target = train_set['label'][permutation]
+    
+
+    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * params.decay if epoch>1\
+                                    and 'sgd' in params.optimizer else optimizer.param_groups[0]['lr']
+    print('Learning rate : {0}'.format(optimizer.param_groups[0]['lr']))
+
+    for stidx in range(0, len(s1), params.batch_size):
+        # prepare batch
+        s1_batch, s1_len = get_batch(s1[stidx:stidx + params.batch_size], word_vec)
+        s2_batch, s2_len = get_batch(s2[stidx:stidx + params.batch_size], word_vec)
+        s1_batch, s2_batch = Variable(s1_batch.cuda()), Variable(s2_batch.cuda())
+        tgt_batch = Variable(torch.LongTensor(target[stidx:stidx + params.batch_size])).cuda()
+        k = s1_batch.size(1)  # actual batch size
+#         print(s1_batch, s1_len) 
+        # model forward
+        output = nli_net((s1_batch, s1_len), (s2_batch, s2_len))
+
+        pred = output.data.max(1)[1]
+        correct += pred.long().eq(tgt_batch.data.long()).cpu().sum()
+        assert len(pred) == len(s1[stidx:stidx + params.batch_size])
+        
+        # loss
+        loss = loss_fn(output, tgt_batch)
+        all_costs.append(loss.data[0])
+        words_count += (s1_batch.nelement() + s2_batch.nelement()) / params.word_emb_dim
+
+        # backward
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # gradient clipping (off by default)
+        shrink_factor = 1
+        total_norm = 0
+        
+        for p in nli_net.parameters():
+            if p.requires_grad:
+                p.grad.data.div_(k)  # divide by the actual batch size
+                total_norm += p.grad.data.norm() ** 2
+        total_norm = np.sqrt(total_norm)
+        
+        if total_norm > params.max_norm:
+            shrink_factor = params.max_norm / total_norm
+        current_lr = optimizer.param_groups[0]['lr'] # current lr (no external "lr", for adam)
+        optimizer.param_groups[0]['lr'] = current_lr * shrink_factor # just for update
+        
+        # optimizer step
+        optimizer.step()
+        optimizer.param_groups[0]['lr'] = current_lr
+
+        if len(all_costs) == 100:
+            logs.append( '{0} ; loss {1} ; sentence/s {2} ; words/s {3} ; accuracy train : {4}'.format(
+                    stidx, round(np.mean(all_costs),2), int(len(all_costs) * params.batch_size / (time.time() - last_time)),
+                    int(words_count * 1.0 / (time.time() - last_time)), round(100.*correct/(stidx+k), 2) ))
+            print(logs[-1])
+            last_time = time.time()
+            words_count = 0
+            all_costs = []
+    train_acc = round(100 * correct/len(s1), 2)
+    print('results : epoch {0} ; mean accuracy train : {1}'.format(epoch, train_acc))
+    return train_acc
+```
+
+
+```python
+def evaluate(epoch, eval_type='valid', matched = True, final_eval=False):
+    nli_net.eval()
+    correct = 0.
+    global val_acc_best, lr, stop_training, adam_stop
+    
+    if eval_type == 'valid' and matched==True:
+        print('\nVALIDATION, matched : Epoch {0}'.format(epoch))
+    else:
+        print('\nVALIDATION, mismatched : Epoch {0}'.format(epoch))
+        
+        
+    if matched:
+        data_m_set = dev_matched_set
+    else:
+        data_m_set = dev_mismatched_set
+    
+    
+    s1    = data_m_set['sentence1']    
+    s2    = data_m_set['sentence2']    
+    target = data_m_set['label'] 
+
+
+    for i in range(0, len(s1), params.batch_size):
+        # prepare batch
+        s1_batch, s1_len = get_batch(s1[i:i + params.batch_size], word_vec)
+        s2_batch, s2_len = get_batch(s2[i:i + params.batch_size], word_vec)
+        s1_batch, s2_batch = Variable(s1_batch.cuda()), Variable(s2_batch.cuda())
+        tgt_batch = Variable(torch.LongTensor(target[i:i + params.batch_size])).cuda()
+        k = s1_batch.size(1)  # actual batch size
+            
+            
+        # model forward
+        output = nli_net((s1_batch, s1_len), (s2_batch, s2_len))
+        
+        pred = output.data.max(1)[1]
+        correct += pred.long().eq(tgt_batch.data.long()).cpu().sum()
+        
+        
+    # save model
+    eval_acc  = round(100 * correct / len(s1),2)
+    if final_eval:
+        print('finalgrep : accuracy {0} : {1}'.format(eval_type, eval_acc))
+    else:
+        print('togrep : results : epoch {0} ; mean accuracy {1} : {2}'.format(epoch, eval_type, eval_acc))
+    
+    if eval_type == 'valid' and epoch <= params.n_epochs:
+        if eval_acc > val_acc_best:
+            print('saving model at epoch {0}'.format(epoch))
+            if not os.path.exists(params.outputdir):
+                os.makedirs(params.outputdir)
+            torch.save(nli_net, os.path.join(params.outputdir, params.outputmodelname))
+            val_acc_best = eval_acc
+        else:
+            if 'sgd' in params.optimizer:
+                optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] / params.lrshrink
+                print('Shrinking lr by : {0}. New lr = {1}'.format(params.lrshrink, optimizer.param_groups[0]['lr']))
+                if optimizer.param_groups[0]['lr'] < params.minlr:
+                    stop_training = True
+            if 'adam' in params.optimizer:
+                # early stopping (at 2nd decrease in accuracy)
+                stop_training = adam_stop
+                adam_stop = True
+    return eval_acc
+```
+
+
+```python
+epoch = 1
+while not stop_training and epoch <= params.n_epochs:
+    train_acc = trainepoch(epoch)
+    eval_acc = evaluate(epoch, eval_type='valid', matched = True)
+    eval_acc = evaluate(epoch, eval_type='valid', matched = False)
+    epoch+=1
+
+```
 
